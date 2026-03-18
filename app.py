@@ -13,7 +13,7 @@ from config import DATE_FORMATS, PARQUET_MESTRE
 
 # ── Página ───────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Detector de Duplicidades",
+    page_title="Detector de Duplicidades de OS",
     page_icon="🔍",
     layout="wide",
 )
@@ -119,22 +119,23 @@ def detect_duplicates(
     cols_extras: tuple[str, ...] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Retorna (df_detalhamento, df_resumo_grupo, df_resumo_servico).
+    Retorna:
+      - df_det          : detalhamento linha a linha (ORIGINAL + DUPLICATA)
+      - df_resumo_grupos: resumo por grupo de duplicidade
+      - df_resumo_serv  : visão analítica por tipo de serviço
 
-    Lógica correta:
-    - Agrupa por (cliente, tipo_serviço)
-    - Ordena por data
-    - Para cada OS, verifica quantas outras OS do mesmo grupo
-      estão dentro da janela de dias APÓS ela
-    - A primeira OS de cada grupo de duplicidade é marcada ORIGINAL
-    - As demais são DUPLICATAS e entram na contagem
-    - Uma OS pode ser ORIGINAL de um grupo e não aparecer
-      como duplicata de outro (cada OS só recebe um papel)
+    Regras:
+      - duplicidade = mesmo cliente + mesmo tipo de serviço
+        com datas dentro da janela de janela_dias dias.
+      - a primeira OS do grupo = ORIGINAL, NÃO entra na contagem.
+      - apenas DUPLICATA entra em qtd_duplicatas.
+      - uma OS já marcada como DUPLICATA não pode virar âncora
+        de outro grupo.
     """
 
     work = df.copy()
 
-    # ── Parsing de datas ──────────────────────────────────────────────────────
+    # ── Datas ────────────────────────────────────────────────────────────────
     if "_data_parsed" in work.columns:
         work["_data_parsed"] = pd.to_datetime(work["_data_parsed"], errors="coerce")
     else:
@@ -145,15 +146,15 @@ def detect_duplicates(
     validas   = total - invalidas
 
     with st.expander("📅 Diagnóstico de datas", expanded=invalidas > 0):
-        d1, d2, d3 = st.columns(3)
-        d1.metric("Total de registros",        f"{total:,}")
-        d2.metric("Datas reconhecidas",         f"{validas:,}")
-        d3.metric("Datas inválidas/ignoradas",  f"{invalidas:,}",
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total de registros",       f"{total:,}")
+        c2.metric("Datas reconhecidas",        f"{validas:,}")
+        c3.metric("Datas inválidas/ignoradas", f"{invalidas:,}",
                   delta=f"-{invalidas}" if invalidas else None,
                   delta_color="inverse")
         if invalidas > 0:
             exemplos = work[work["_data_parsed"].isna()][col_data].dropna().unique()[:10]
-            st.warning(f"Exemplos: `{'`, `'.join(map(str, exemplos))}`")
+            st.warning(f"Exemplos não reconhecidos: `{'`, `'.join(map(str, exemplos))}`")
         else:
             amostra = work[[col_data, "_data_parsed"]].dropna().head(5).copy()
             amostra["_data_parsed"] = amostra["_data_parsed"].dt.strftime("%d/%m/%Y")
@@ -161,29 +162,16 @@ def detect_duplicates(
             st.success("Todas as datas foram reconhecidas.")
             st.dataframe(amostra, use_container_width=True)
 
-    # ── Prepara working set ───────────────────────────────────────────────────
     work = work.dropna(subset=["_data_parsed"]).copy()
+    work = work.reset_index(drop=True)
+    work["_row_id"]       = work.index
     work["_cliente_norm"] = work[col_cliente].astype(str).str.strip().str.upper()
     work["_servico_norm"] = work[col_servico].astype(str).str.strip().str.upper()
 
-    # índice sequencial único para cada linha
-    work = work.reset_index(drop=True)
-    work["_row_id"] = work.index
-
-    janela = pd.Timedelta(days=janela_dias)
-
     # ── Algoritmo de detecção ─────────────────────────────────────────────────
-    #
-    # Para cada par (cliente, serviço):
-    #   - Ordena as OS por data
-    #   - Percorre cada OS como possível "âncora" (ORIGINAL)
-    #   - Todas as OS dentro da janela APÓS a âncora são DUPLICATAS daquele grupo
-    #   - Uma OS já classificada como DUPLICATA não pode ser âncora
-    #     de um novo grupo (evita dupla contagem)
-    #
-    registros = []   # lista final com todas as linhas classificadas
+    registros = []
 
-    for (cliente, servico), grp in work.groupby(["_cliente_norm", "_servico_norm"], sort=False):
+    for (_, _), grp in work.groupby(["_cliente_norm", "_servico_norm"], sort=False):
         if len(grp) < 2:
             continue
 
@@ -192,63 +180,54 @@ def detect_duplicates(
         row_ids = grp["_row_id"].tolist()
         n       = len(grp)
 
-        classificacao = {}   # row_id -> {"grupo": int, "tipo": str}
+        classificacao = {}
         grupo_counter = 0
         i = 0
 
         while i < n:
             rid_i = row_ids[i]
 
-            # Se já foi classificado como DUPLICATA, não pode ser âncora
+            # se já é DUPLICATA, não pode ser âncora de novo grupo
             if rid_i in classificacao and classificacao[rid_i]["tipo"] == "DUPLICATA":
                 i += 1
                 continue
 
-            # Busca todas as OS dentro da janela a partir de datas[i]
-            duplicatas_encontradas = []
+            # busca posteriores dentro da janela
+            duplicatas = []
             for j in range(i + 1, n):
                 delta = (datas[j] - datas[i]).days
                 if delta <= janela_dias:
                     rid_j = row_ids[j]
-                    # Só entra se ainda não foi classificada
                     if rid_j not in classificacao:
-                        duplicatas_encontradas.append(j)
+                        duplicatas.append(j)
                 else:
-                    break   # já está ordenado, pode parar
+                    break   # lista ordenada, pode parar
 
-            if duplicatas_encontradas:
+            if duplicatas:
                 grupo_counter += 1
-
-                # Marca a âncora como ORIGINAL (se ainda não foi marcada)
                 if rid_i not in classificacao:
                     classificacao[rid_i] = {"grupo": grupo_counter, "tipo": "ORIGINAL"}
-
-                # Marca as duplicatas
-                for j in duplicatas_encontradas:
+                for j in duplicatas:
                     rid_j = row_ids[j]
                     classificacao[rid_j] = {"grupo": grupo_counter, "tipo": "DUPLICATA"}
 
             i += 1
 
-        # Adiciona à lista de resultado
-        for idx in range(n):
-            rid = row_ids[idx]
-            if rid in classificacao:
-                registros.append({
-                    "_row_id":           rid,
-                    "grupo_duplicidade":  classificacao[rid]["grupo"],
-                    "tipo_registro":     classificacao[rid]["tipo"],
-                })
+        for rid, info in classificacao.items():
+            registros.append({
+                "_row_id":           rid,
+                "grupo_duplicidade": info["grupo"],
+                "tipo_registro":     info["tipo"],
+            })
 
     if not registros:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-    # ── Monta DataFrame de saída ──────────────────────────────────────────────
-    df_class  = pd.DataFrame(registros).drop_duplicates("_row_id")
-    df_merged = work.merge(df_class, on="_row_id", how="inner")
-    df_merged = df_merged.sort_values(["grupo_duplicidade", "_data_parsed"]).reset_index(drop=True)
+    df_class = pd.DataFrame(registros).drop_duplicates("_row_id")
+    df_merge = work.merge(df_class, on="_row_id", how="inner")
+    df_merge = df_merge.sort_values(["grupo_duplicidade", "_data_parsed"]).reset_index(drop=True)
 
-    # Colunas de saída do detalhamento
+    # ── Detalhamento ─────────────────────────────────────────────────────────
     output_cols = ["grupo_duplicidade", "tipo_registro"]
     if col_os:
         output_cols.append(col_os)
@@ -256,15 +235,14 @@ def detect_duplicates(
     if cols_extras:
         output_cols += [c for c in cols_extras if c not in output_cols]
 
-    df_det = df_merged[[c for c in output_cols if c in df_merged.columns]].copy()
-    df_det[col_data] = df_merged["_data_parsed"].dt.strftime("%d/%m/%Y")
+    df_det = df_merge[[c for c in output_cols if c in df_merge.columns]].copy()
+    df_det[col_data] = df_merge["_data_parsed"].dt.strftime("%d/%m/%Y")
 
     # ── Resumo por grupo ──────────────────────────────────────────────────────
     resumo_grupos = []
-    for gid, grp in df_merged.groupby("grupo_duplicidade"):
+    for gid, grp in df_merge.groupby("grupo_duplicidade"):
         orig = grp[grp["tipo_registro"] == "ORIGINAL"]
         dups = grp[grp["tipo_registro"] == "DUPLICATA"]
-
         if orig.empty:
             continue
 
@@ -272,76 +250,54 @@ def detect_duplicates(
         datas_dup = dups["_data_parsed"]
 
         row = {
-            "grupo":                     int(gid),
-            "cliente":                   o[col_cliente],
-            "tipo_servico":              o[col_servico],
-            "data_os_original":          o["_data_parsed"].strftime("%d/%m/%Y"),
-            "qtd_duplicatas":            len(dups),
-            "data_primeira_duplicata":   datas_dup.min().strftime("%d/%m/%Y") if not dups.empty else "—",
-            "data_ultima_duplicata":     datas_dup.max().strftime("%d/%m/%Y") if not dups.empty else "—",
-            "intervalo_dias":            (datas_dup.max() - datas_dup.min()).days if not dups.empty else 0,
+            "grupo":                   int(gid),
+            "cliente":                 o[col_cliente],
+            "tipo_servico":            o[col_servico],
+            "data_os_original":        o["_data_parsed"].strftime("%d/%m/%Y"),
+            "qtd_duplicatas":          len(dups),
+            "data_primeira_duplicata": datas_dup.min().strftime("%d/%m/%Y") if not dups.empty else "—",
+            "data_ultima_duplicata":   datas_dup.max().strftime("%d/%m/%Y") if not dups.empty else "—",
+            "intervalo_dias":          (datas_dup.max() - datas_dup.min()).days if not dups.empty else 0,
         }
         if col_os:
             row["os_original"]   = str(o[col_os])
             row["os_duplicadas"] = ", ".join(dups[col_os].astype(str).tolist())
-
         resumo_grupos.append(row)
 
     df_resumo_grupos = pd.DataFrame(resumo_grupos)
 
     # ── Resumo por tipo de serviço ────────────────────────────────────────────
-    #
-    # Para cada tipo de serviço:
-    #   - Total de OS duplicadas (sem contar originais)
-    #   - Clientes únicos afetados
-    #   - Distribuição: faixas de quantidades de pedidos por cliente
-    #
-    resumo_servico = []
-
-    # Base para distribuição: todas as OS (originais + duplicatas) por cliente+serviço
-    # para calcular quantos pedidos cada cliente fez no período
-    contagem_cliente_servico = (
+    cont_cli_serv = (
         work.groupby(["_servico_norm", "_cliente_norm"])
         .size()
         .reset_index(name="total_os_cliente")
     )
 
-    # Só interessa serviços que tiveram duplicatas
-    servicos_com_dup = df_merged[df_merged["tipo_registro"] == "DUPLICATA"][col_servico].unique()
+    resumo_servico = []
+    dups_total = df_merge[df_merge["tipo_registro"] == "DUPLICATA"]
 
-    for servico in servicos_com_dup:
-        servico_norm = str(servico).strip().upper()
+    for servico_norm, grp_serv in dups_total.groupby("_servico_norm"):
+        servico_val   = grp_serv[col_servico].iloc[0]
+        total_dup     = grp_serv.shape[0]
+        clientes_dup  = grp_serv["_cliente_norm"].nunique()
+        total_os_serv = work[work["_servico_norm"] == servico_norm].shape[0]
 
-        # duplicatas deste serviço
-        dups_serv = df_merged[
-            (df_merged["tipo_registro"] == "DUPLICATA") &
-            (df_merged["_servico_norm"] == servico_norm)
-        ]
-
-        # clientes únicos que geraram duplicata neste serviço
-        clientes_dup = dups_serv["_cliente_norm"].nunique()
-
-        # total de OS do serviço no período (base completa, não só duplicatas)
-        total_os_servico = work[work["_servico_norm"] == servico_norm].shape[0]
-
-        # distribuição de pedidos por cliente (base completa do período)
-        dist = contagem_cliente_servico[
-            contagem_cliente_servico["_servico_norm"] == servico_norm
+        dist = cont_cli_serv[
+            cont_cli_serv["_servico_norm"] == servico_norm
         ]["total_os_cliente"]
 
         resumo_servico.append({
-            "tipo_servico":              servico,
-            "total_os_no_periodo":       total_os_servico,
-            "total_duplicatas":          len(dups_serv),
-            "clientes_com_duplicata":    clientes_dup,
-            "media_duplicatas_cliente":  round(len(dups_serv) / clientes_dup, 2) if clientes_dup else 0,
-            # distribuição de faixas
-            "clientes_1_pedido":         int((dist == 1).sum()),
-            "clientes_2_pedidos":        int((dist == 2).sum()),
-            "clientes_3_pedidos":        int((dist == 3).sum()),
-            "clientes_4_a_6_pedidos":    int(((dist >= 4) & (dist <= 6)).sum()),
-            "clientes_7_a_10_pedidos":   int(((dist >= 7) & (dist <= 10)).sum()),
-            "clientes_mais_10_pedidos":  int((dist > 10).sum()),
+            "tipo_servico":                 servico_val,
+            "total_os_no_periodo":          int(total_os_serv),
+            "total_duplicatas":             int(total_dup),
+            "clientes_com_duplicata":       int(clientes_dup),
+            "media_duplicatas_por_cliente": round(total_dup / clientes_dup, 2) if clientes_dup else 0,
+            "clientes_1_pedido":            int((dist == 1).sum()),
+            "clientes_2_pedidos":           int((dist == 2).sum()),
+            "clientes_3_pedidos":           int((dist == 3).sum()),
+            "clientes_4_a_6_pedidos":       int(((dist >= 4) & (dist <= 6)).sum()),
+            "clientes_7_a_10_pedidos":      int(((dist >= 7) & (dist <= 10)).sum()),
+            "clientes_mais_10_pedidos":     int((dist > 10).sum()),
         })
 
     df_resumo_servico = pd.DataFrame(resumo_servico).sort_values(
@@ -369,6 +325,419 @@ def to_excel_bytes(
     palette       = ["FFF2CC", "FDEBD0", "D5F5E3", "D6EAF8", "F9EBEA",
                      "EAF2FF", "FDF2F8", "E8F8F5", "FDFEFE", "F4ECF7"]
 
-    def auto_col_width(ws, df):
-        for c_
+    def write_sheet(ws, df, title, grupo_col=None, destacar_tipo=False):
+        ws.title = title
+        if df.empty:
+            ws.cell(1, 1, "Nenhum dado para exibir.")
+            return
 
+        for c_idx, col in enumerate(df.columns, 1):
+            cell           = ws.cell(row=1, column=c_idx, value=col)
+            cell.fill      = header_fill
+            cell.font      = header_font
+            cell.alignment = header_align
+            cell.border    = border
+            ws.column_dimensions[get_column_letter(c_idx)].width = max(16, len(str(col)) + 6)
+        ws.row_dimensions[1].height = 28
+
+        has_tipo = destacar_tipo and "tipo_registro" in df.columns
+
+        for r_idx, row in enumerate(df.itertuples(index=False), 2):
+            grupo_val = None
+            if grupo_col and grupo_col in df.columns:
+                grupo_val = getattr(row, grupo_col.replace(" ", "_"), None)
+
+            tipo_val = getattr(row, "tipo_registro", None) if has_tipo else None
+
+            if tipo_val == "ORIGINAL":
+                row_fill = fill_original
+            elif grupo_val is not None:
+                color    = palette[(int(grupo_val) - 1) % len(palette)]
+                row_fill = PatternFill("solid", fgColor=color)
+            else:
+                row_fill = None
+
+            for c_idx, val in enumerate(row, 1):
+                cell           = ws.cell(row=r_idx, column=c_idx, value=val if pd.notna(val) else None)
+                cell.border    = border
+                cell.alignment = Alignment(vertical="center")
+                if row_fill:
+                    cell.fill = row_fill
+
+        ws.freeze_panes = "A2"
+
+    ws1 = wb.active
+    write_sheet(ws1, df_det, "Detalhamento", grupo_col="grupo_duplicidade", destacar_tipo=True)
+
+    ws2 = wb.create_sheet("Resumo por Grupo")
+    write_sheet(ws2, df_grupos, "Resumo por Grupo", grupo_col="grupo")
+
+    ws3 = wb.create_sheet("Resumo por Serviço")
+    write_sheet(ws3, df_servico, "Resumo por Serviço")
+
+    ws4 = wb.create_sheet("Configurações")
+    ws4.column_dimensions["A"].width = 35
+    ws4.column_dimensions["B"].width = 35
+    total_dup = int(df_det[df_det["tipo_registro"] == "DUPLICATA"].shape[0]) if not df_det.empty else 0
+    meta = [
+        ("Gerado em",                  datetime.now().strftime("%d/%m/%Y %H:%M")),
+        ("Janela de análise (dias)",   janela_dias),
+        ("Total de grupos",            df_grupos["grupo"].nunique() if not df_grupos.empty else 0),
+        ("Total de OS duplicadas",     total_dup),
+        ("Serviços com duplicidade",   df_servico["tipo_servico"].nunique() if not df_servico.empty else 0),
+    ]
+    for r, (k, v) in enumerate(meta, 1):
+        ws4.cell(r, 1, k).font = Font(bold=True)
+        ws4.cell(r, 2, str(v))
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+# ── Paginação ─────────────────────────────────────────────────────────────────
+def paginar(df: pd.DataFrame, key: str, page_size: int = 500):
+    if len(df) <= page_size:
+        st.dataframe(df, use_container_width=True, height=450)
+        return
+    total_pages = (len(df) - 1) // page_size + 1
+    page = st.number_input(
+        "Página", min_value=1, max_value=total_pages, value=1, step=1, key=key
+    )
+    start = (page - 1) * page_size
+    st.dataframe(df.iloc[start: start + page_size], use_container_width=True, height=450)
+    st.caption(f"Exibindo {start+1:,}–{min(start+page_size, len(df)):,} de {len(df):,} registros")
+
+
+# ── Ingestão de novo lote ─────────────────────────────────────────────────────
+def ingerir_lote():
+    st.sidebar.divider()
+    st.sidebar.subheader("📥 Ingerir novo lote")
+
+    arq_lote = st.sidebar.file_uploader(
+        "Arquivo do lote (.xlsx/.csv)",
+        type=["xlsx", "xls", "csv"],
+        key="upload_lote",
+    )
+
+    if not arq_lote:
+        return
+
+    buf = arq_lote.read()
+
+    try:
+        df_preview = (
+            pd.read_csv(io.BytesIO(buf), dtype=str, nrows=3)
+            if arq_lote.name.endswith(".csv")
+            else pd.read_excel(io.BytesIO(buf), dtype=str, nrows=3)
+        )
+    except Exception as e:
+        st.sidebar.error(f"Erro ao ler arquivo: {e}")
+        return
+
+    df_preview.columns = df_preview.columns.str.strip()
+    cols_lote = list(df_preview.columns)
+
+    lote_nome    = st.sidebar.text_input("Nome do lote", value=datetime.now().strftime("%Y-%m"))
+    lote_cliente = st.sidebar.selectbox("Coluna cliente",          cols_lote, key="lc")
+    lote_servico = st.sidebar.selectbox("Coluna serviço",          cols_lote, key="ls")
+    lote_data    = st.sidebar.selectbox("Coluna data",             cols_lote, key="ld")
+    lote_os_raw  = st.sidebar.selectbox("Coluna OS (opcional)",    ["— nenhuma —"] + cols_lote, key="lo")
+    lote_os      = None if lote_os_raw == "— nenhuma —" else lote_os_raw
+
+    if not st.sidebar.button("⚙️ Processar e adicionar à base", use_container_width=True):
+        return
+
+    try:
+        df_lote = (
+            pd.read_csv(io.BytesIO(buf), dtype=str)
+            if arq_lote.name.endswith(".csv")
+            else pd.read_excel(io.BytesIO(buf), dtype=str)
+        )
+        df_lote.columns = df_lote.columns.str.strip()
+    except Exception as e:
+        st.sidebar.error(f"Erro ao processar arquivo: {e}")
+        return
+
+    # Verifica colunas obrigatórias
+    obrigatorias = [lote_cliente, lote_servico, lote_data]
+    faltando = [c for c in obrigatorias if c not in df_lote.columns]
+    if faltando:
+        st.sidebar.error(f"Colunas não encontradas: {faltando}")
+        return
+
+    # Verifica lote duplicado
+    lotes_existentes = listar_lotes()
+    if lote_nome in lotes_existentes:
+        st.sidebar.error(f"Lote '{lote_nome}' já existe. Escolha outro nome.")
+        return
+
+    # Processa
+    df_lote["_data_parsed"]  = parse_dates_robust(df_lote[lote_data].astype(str).str.strip())
+    df_lote["_cliente_norm"] = df_lote[lote_cliente].astype(str).str.strip().str.upper()
+    df_lote["_servico_norm"] = df_lote[lote_servico].astype(str).str.strip().str.upper()
+    df_lote["_lote"]         = lote_nome
+    df_lote["_ingestao_ts"]  = datetime.now().isoformat()
+
+    invalidas = df_lote["_data_parsed"].isna().sum()
+
+    # Atualiza mestre
+    if PARQUET_MESTRE.exists():
+        df_antigo = pd.read_parquet(PARQUET_MESTRE)
+        df_total  = pd.concat([df_antigo, df_lote], ignore_index=True)
+    else:
+        df_total = df_lote
+
+    df_total.to_parquet(PARQUET_MESTRE, index=False, compression="snappy")
+
+    st.sidebar.success(
+        f"✅ Lote **{lote_nome}** adicionado!\n\n"
+        f"- {len(df_lote):,} registros no lote\n"
+        f"- {len(df_total):,} registros na base total\n"
+        f"- {invalidas:,} datas inválidas ignoradas"
+    )
+    st.cache_data.clear()
+    st.rerun()
+
+
+# ── Interface principal ───────────────────────────────────────────────────────
+st.title("🔍 Detector de Duplicidades de OS")
+st.caption(
+    "Base histórica via DuckDB + Parquet | "
+    "A OS original não entra na contagem de duplicatas."
+)
+
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.header("📦 Base Histórica")
+
+    if not PARQUET_MESTRE.exists():
+        st.warning("Nenhuma base mestre encontrada.\nIngira o primeiro lote abaixo.")
+    else:
+        stats = stats_base()
+        st.metric("Total de OS",        f"{int(stats.get('total_registros', 0)):,}")
+        st.metric("Lotes ingeridos",     int(stats.get("total_lotes", 0)))
+        st.metric("Clientes únicos",     f"{int(stats.get('clientes_unicos', 0)):,}")
+        st.metric("Serviços distintos",  int(stats.get("servicos_unicos", 0)))
+
+        data_min = stats.get("data_min", "")
+        data_max = stats.get("data_max", "")
+        if data_min and data_max:
+            try:
+                d_min = pd.to_datetime(data_min).strftime("%d/%m/%Y")
+                d_max = pd.to_datetime(data_max).strftime("%d/%m/%Y")
+                st.caption(f"Período na base: {d_min} → {d_max}")
+            except Exception:
+                pass
+
+        if st.button("🔄 Recarregar estatísticas", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
+
+# Ingestão sempre disponível na sidebar
+ingerir_lote()
+
+st.divider()
+
+# ── Verifica base ─────────────────────────────────────────────────────────────
+if not PARQUET_MESTRE.exists():
+    st.info("Ingira o primeiro lote pela barra lateral para começar.")
+    st.stop()
+
+# ── Filtros de consulta ───────────────────────────────────────────────────────
+st.subheader("🗓️ Filtros de consulta")
+
+lotes_disponiveis = listar_lotes()
+
+fc1, fc2 = st.columns(2)
+usar_periodo = fc1.checkbox("Filtrar por período de datas", value=True)
+usar_lotes   = fc2.checkbox("Filtrar por lote(s) específico(s)")
+
+data_ini_q = data_fim_q = None
+lotes_sel  = None
+
+if usar_periodo:
+    p1, p2 = st.columns(2)
+    data_ini_q = str(p1.date_input(
+        "Data inicial", value=datetime.today() - timedelta(days=90)
+    ))
+    data_fim_q = str(p2.date_input(
+        "Data final", value=datetime.today()
+    ))
+
+if usar_lotes:
+    lotes_sel = st.multiselect(
+        "Lotes",
+        lotes_disponiveis,
+        default=lotes_disponiveis[-1:] if lotes_disponiveis else [],
+    )
+
+if st.button("📥 Carregar dados da base", use_container_width=True):
+    df_base = carregar_base(
+        data_ini=data_ini_q,
+        data_fim=data_fim_q,
+        lotes=lotes_sel if usar_lotes else None,
+    )
+    st.session_state["df_base"]    = df_base
+    st.session_state["cols_base"]  = [c for c in df_base.columns if not c.startswith("_")]
+    st.success(f"✅ {len(df_base):,} registros carregados.")
+
+# ── Configurações de análise ──────────────────────────────────────────────────
+if "df_base" in st.session_state and not st.session_state["df_base"].empty:
+    df_base      = st.session_state["df_base"]
+    cols_visiveis = st.session_state["cols_base"]
+
+    with st.expander("👁️ Prévia dos dados carregados (10 primeiras linhas)", expanded=False):
+        st.dataframe(df_base[cols_visiveis].head(10), use_container_width=True)
+
+    st.divider()
+    st.subheader("⚙️ Configurações da análise")
+
+    def suggest(keywords, cols):
+        for kw in keywords:
+            for col in cols:
+                if kw.lower() in col.lower():
+                    return col
+        return cols[0] if cols else None
+
+    ca1, ca2, ca3 = st.columns(3)
+
+    col_cliente = ca1.selectbox(
+        "👤 Coluna de cliente",
+        cols_visiveis,
+        index=cols_visiveis.index(
+            suggest(["cliente", "matricula", "cpf", "cod"], cols_visiveis) or cols_visiveis[0]
+        ),
+    )
+    col_servico = ca2.selectbox(
+        "🔧 Coluna de tipo de serviço",
+        cols_visiveis,
+        index=cols_visiveis.index(
+            suggest(["servico", "serviço", "tipo", "categoria"], cols_visiveis) or cols_visiveis[0]
+        ),
+    )
+    col_data = ca3.selectbox(
+        "📅 Coluna de data",
+        cols_visiveis,
+        index=cols_visiveis.index(
+            suggest(["data", "dt_", "abertura", "criacao"], cols_visiveis) or cols_visiveis[0]
+        ),
+    )
+
+    ca4, ca5 = st.columns(2)
+    none_opt = "— nenhuma —"
+
+    col_os = ca4.selectbox(
+        "🔢 Coluna de número da OS (opcional)",
+        [none_opt] + cols_visiveis,
+    )
+    col_os = None if col_os == none_opt else col_os
+
+    janela_dias = ca5.number_input(
+        "📆 Janela de duplicidade (dias)",
+        min_value=1, max_value=3650, value=30, step=1,
+    )
+
+    extras_disp = [c for c in cols_visiveis if c not in [col_cliente, col_servico, col_data, col_os]]
+    cols_extras = st.multiselect("➕ Colunas extras no relatório (opcional)", extras_disp)
+
+    st.divider()
+
+    if st.button("🚀 Analisar duplicidades", type="primary", use_container_width=True):
+        df_det, df_grupos, df_servico = detect_duplicates(
+            df=df_base,
+            col_cliente=col_cliente,
+            col_servico=col_servico,
+            col_data=col_data,
+            janela_dias=int(janela_dias),
+            col_os=col_os,
+            cols_extras=tuple(cols_extras) if cols_extras else None,
+        )
+        st.session_state["df_det"]     = df_det
+        st.session_state["df_grupos"]  = df_grupos
+        st.session_state["df_servico"] = df_servico
+        st.session_state["janela"]     = int(janela_dias)
+
+    # ── Resultados ────────────────────────────────────────────────────────────
+    if "df_det" in st.session_state:
+        df_det     = st.session_state["df_det"]
+        df_grupos  = st.session_state["df_grupos"]
+        df_servico = st.session_state["df_servico"]
+        janela     = st.session_state["janela"]
+
+        st.divider()
+
+        if df_det.empty:
+            st.success("✅ Nenhuma duplicidade encontrada com os parâmetros informados.")
+        else:
+            total_dup = int(df_det[df_det["tipo_registro"] == "DUPLICATA"].shape[0])
+
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Grupos duplicados",        f"{df_grupos['grupo'].nunique():,}")
+            k2.metric("Total de OS duplicadas",   f"{total_dup:,}")
+            k3.metric("Janela utilizada",          f"{janela} dias")
+            k4.metric("Serviços com duplicidade",  f"{df_servico['tipo_servico'].nunique():,}")
+
+            st.divider()
+
+            tab1, tab2, tab3 = st.tabs([
+                "📄 Detalhamento por OS",
+                "📊 Resumo por Grupo",
+                "🧩 Visão por Tipo de Serviço",
+            ])
+
+            with tab1:
+                st.caption(
+                    "🟢 **Verde** = OS ORIGINAL (legítima, não contada como duplicata) | "
+                    "🟡 **Colorido por grupo** = OS DUPLICATA"
+                )
+                paginar(df_det, key="pag_det")
+
+            with tab2:
+                st.caption(
+                    "Uma linha por grupo de duplicidade. "
+                    "A coluna **qtd_duplicatas** não inclui a OS original."
+                )
+                paginar(df_grupos, key="pag_grp")
+
+            with tab3:
+                st.caption(
+                    "Agrupamento por tipo de serviço: total de duplicatas, "
+                    "clientes afetados e distribuição por faixas de pedidos por cliente."
+                )
+                if not df_servico.empty:
+                    # Destaca a linha de maior volume
+                    st.dataframe(df_servico, use_container_width=True, height=450)
+
+                    st.divider()
+                    st.markdown("#### 📈 Distribuição de pedidos por cliente (top 10 serviços)")
+
+                    top10 = df_servico.head(10)
+                    faixas = [
+                        "clientes_1_pedido",
+                        "clientes_2_pedidos",
+                        "clientes_3_pedidos",
+                        "clientes_4_a_6_pedidos",
+                        "clientes_7_a_10_pedidos",
+                        "clientes_mais_10_pedidos",
+                    ]
+                    labels = ["1", "2", "3", "4–6", "7–10", ">10"]
+
+                    df_chart = (
+                        top10.set_index("tipo_servico")[faixas]
+                        .rename(columns=dict(zip(faixas, labels)))
+                        .T
+                    )
+                    st.bar_chart(df_chart)
+
+            st.divider()
+
+            xlsx_bytes = to_excel_bytes(df_det, df_grupos, df_servico, janela)
+            st.download_button(
+                label="⬇️ Baixar relatório XLSX",
+                data=xlsx_bytes,
+                file_name=f"duplicidades_os_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
