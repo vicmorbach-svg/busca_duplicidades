@@ -105,6 +105,7 @@ def parse_dates_robust(series: pd.Series) -> pd.Series:
 
 # ── Detecção de duplicidades ──────────────────────────────────────────────────
 @st.cache_data(show_spinner="🔎 Detectando duplicidades...")
+@st.cache_data(show_spinner="🔎 Detectando duplicidades...")
 def detect_duplicates(
     df: pd.DataFrame,
     col_cliente: str,
@@ -115,22 +116,15 @@ def detect_duplicates(
     cols_extras: tuple[str, ...] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Retorna (df_det, df_resumo_grupos, df_resumo_servico).
-
-    Regras:
-      - Duplicidade = mesmo cliente + mesmo tipo de serviço
-        com datas dentro da janela de janela_dias dias.
-      - A PRIMEIRA OS do grupo = ORIGINAL, não entra na contagem.
-      - As demais = DUPLICATA, entram na contagem.
-      - Uma OS já marcada DUPLICATA não pode virar âncora de novo grupo.
-      - Ponteiro avança i += 1 sempre (não pula o cluster inteiro),
-        garantindo que cada OS seja avaliada como potencial âncora.
+    Retorna:
+      - df_det          : detalhamento (ORIGINAL + DUPLICATA)
+      - df_resumo_grupos: resumo por grupo
+      - df_resumo_serv  : resumo por tipo de serviço
     """
 
     work = df.copy()
 
-    # ── Parsing de datas ──────────────────────────────────────────────────────
-    # Se já veio do Parquet com _data_parsed, usa direto
+    # 1) Datas
     if "_data_parsed" in work.columns:
         work["_data_parsed"] = pd.to_datetime(work["_data_parsed"], errors="coerce")
     else:
@@ -140,11 +134,11 @@ def detect_duplicates(
     invalidas = work["_data_parsed"].isna().sum()
     validas   = total - invalidas
 
-    with st.expander("📅 Diagnóstico de parsing de datas", expanded=invalidas > 0):
-        d1, d2, d3 = st.columns(3)
-        d1.metric("Total de registros",       f"{total:,}")
-        d2.metric("Datas reconhecidas",        f"{validas:,}")
-        d3.metric("Datas inválidas/ignoradas", f"{invalidas:,}",
+    with st.expander("📅 Diagnóstico de datas", expanded=invalidas > 0):
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total de registros",       f"{total:,}")
+        c2.metric("Datas reconhecidas",        f"{validas:,}")
+        c3.metric("Datas inválidas/ignoradas", f"{invalidas:,}",
                   delta=f"-{invalidas}" if invalidas else None,
                   delta_color="inverse")
         if invalidas > 0:
@@ -154,27 +148,23 @@ def detect_duplicates(
             amostra = work[[col_data, "_data_parsed"]].dropna().head(5).copy()
             amostra["_data_parsed"] = amostra["_data_parsed"].dt.strftime("%d/%m/%Y")
             amostra.columns = ["Valor original", "Interpretado como"]
-            st.success("Todas as datas foram reconhecidas com sucesso.")
+            st.success("Todas as datas foram reconhecidas.")
             st.dataframe(amostra, use_container_width=True)
 
+    # 2) Limpa linhas sem data OU sem cliente OU sem tipo de serviço
     work = work.dropna(subset=["_data_parsed"]).copy()
+    work = work[work[col_cliente].notna() & work[col_servico].notna()].copy()
+
+    if work.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
     work = work.reset_index(drop=True)
     work["_row_id"]       = work.index
     work["_cliente_norm"] = work[col_cliente].astype(str).str.strip().str.upper()
     work["_servico_norm"] = work[col_servico].astype(str).str.strip().str.upper()
 
-    # ── Algoritmo de detecção ─────────────────────────────────────────────────
-    #
-    # Para cada par (cliente, serviço):
-    #   1. Ordena por data crescente
-    #   2. Percorre cada OS como possível âncora (ORIGINAL)
-    #   3. Se já foi marcada DUPLICATA → pula, não vira âncora
-    #   4. Busca todas as OS posteriores não classificadas dentro da janela
-    #   5. Se achou ≥ 1 → cria grupo: âncora = ORIGINAL, demais = DUPLICATA
-    #   6. Avança i += 1 (nunca pula o cluster inteiro)
-    #
+    # 3) Algoritmo de detecção (janela) ------------------------------
     registros = []
-
     for (_, _), grp in work.groupby(["_cliente_norm", "_servico_norm"], sort=False):
         if len(grp) < 2:
             continue
@@ -184,19 +174,18 @@ def detect_duplicates(
         row_ids = grp["_row_id"].tolist()
         n       = len(grp)
 
-        classificacao = {}   # row_id -> {"grupo": int, "tipo": str}
+        classificacao = {}   # row_id -> {"grupo": int, "tipo": "ORIGINAL"|"DUPLICATA"}
         grupo_counter = 0
         i = 0
 
         while i < n:
             rid_i = row_ids[i]
 
-            # DUPLICATA não vira âncora de novo grupo
+            # se já foi marcada DUPLICATA, não vira âncora
             if rid_i in classificacao and classificacao[rid_i]["tipo"] == "DUPLICATA":
                 i += 1
                 continue
 
-            # Busca OS posteriores dentro da janela ainda não classificadas
             duplicatas_j = []
             for j in range(i + 1, n):
                 delta = (datas[j] - datas[i]).days
@@ -205,7 +194,7 @@ def detect_duplicates(
                     if rid_j not in classificacao:
                         duplicatas_j.append(j)
                 else:
-                    break   # lista ordenada → pode parar
+                    break
 
             if duplicatas_j:
                 grupo_counter += 1
@@ -216,7 +205,7 @@ def detect_duplicates(
                 for j in duplicatas_j:
                     classificacao[row_ids[j]] = {"grupo": grupo_counter, "tipo": "DUPLICATA"}
 
-            i += 1   # avança 1 a 1, nunca pula o cluster
+            i += 1
 
         for rid, info in classificacao.items():
             registros.append({
@@ -228,13 +217,14 @@ def detect_duplicates(
     if not registros:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-    # ── Monta DataFrame de saída ──────────────────────────────────────────────
+    # 4) Monta df_merged com todas as colunas originais + classificação
     df_class  = pd.DataFrame(registros).drop_duplicates("_row_id")
     df_merged = work.merge(df_class, on="_row_id", how="inner")
     df_merged = df_merged.sort_values(
         ["grupo_duplicidade", "_data_parsed", "tipo_registro"]
     ).reset_index(drop=True)
 
+    # 5) Detalhamento: sempre inclui as colunas escolhidas
     output_cols = ["grupo_duplicidade", "tipo_registro"]
     if col_os:
         output_cols.append(col_os)
@@ -242,10 +232,11 @@ def detect_duplicates(
     if cols_extras:
         output_cols += [c for c in cols_extras if c not in output_cols]
 
-    df_det = df_merged[[c for c in output_cols if c in df_merged.columns]].copy()
+    cols_existentes = [c for c in output_cols if c in df_merged.columns]
+    df_det = df_merged[cols_existentes].copy()
     df_det[col_data] = df_merged["_data_parsed"].dt.strftime("%d/%m/%Y")
 
-    # ── Resumo por grupo ──────────────────────────────────────────────────────
+    # 6) Resumo por grupo
     resumo_grupos = []
     for gid, grp in df_merged.groupby("grupo_duplicidade"):
         orig = grp[grp["tipo_registro"] == "ORIGINAL"]
@@ -261,7 +252,7 @@ def detect_duplicates(
             "cliente":                 o[col_cliente],
             "tipo_servico":            o[col_servico],
             "data_os_original":        o["_data_parsed"].strftime("%d/%m/%Y"),
-            "qtd_duplicatas":          len(dups),   # ← só DUPLICATA conta
+            "qtd_duplicatas":          len(dups),
             "data_primeira_duplicata": datas_dup.min().strftime("%d/%m/%Y") if not dups.empty else "—",
             "data_ultima_duplicata":   datas_dup.max().strftime("%d/%m/%Y") if not dups.empty else "—",
             "intervalo_dias":          (datas_dup.max() - datas_dup.min()).days if not dups.empty else 0,
@@ -273,13 +264,12 @@ def detect_duplicates(
 
     df_resumo_grupos = pd.DataFrame(resumo_grupos)
 
-    # ── Resumo por tipo de serviço ────────────────────────────────────────────
+    # 7) Resumo por serviço
     cont_cli_serv = (
         work.groupby(["_servico_norm", "_cliente_norm"])
         .size()
         .reset_index(name="total_os_cliente")
     )
-
     resumo_servico = []
     dups_only = df_merged[df_merged["tipo_registro"] == "DUPLICATA"]
 
