@@ -105,7 +105,6 @@ def parse_dates_robust(series: pd.Series) -> pd.Series:
 
 # ── Detecção de duplicidades ──────────────────────────────────────────────────
 @st.cache_data(show_spinner="🔎 Detectando duplicidades...")
-@st.cache_data(show_spinner="🔎 Detectando duplicidades...")
 def detect_duplicates(
     df: pd.DataFrame,
     col_cliente: str,
@@ -115,16 +114,10 @@ def detect_duplicates(
     col_os: str | None = None,
     cols_extras: tuple[str, ...] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    Retorna:
-      - df_det          : detalhamento (ORIGINAL + DUPLICATA)
-      - df_resumo_grupos: resumo por grupo
-      - df_resumo_serv  : resumo por tipo de serviço
-    """
 
     work = df.copy()
 
-    # 1) Datas
+    # ── Datas ────────────────────────────────────────────────────────────────
     if "_data_parsed" in work.columns:
         work["_data_parsed"] = pd.to_datetime(work["_data_parsed"], errors="coerce")
     else:
@@ -151,9 +144,12 @@ def detect_duplicates(
             st.success("Todas as datas foram reconhecidas.")
             st.dataframe(amostra, use_container_width=True)
 
-    # 2) Limpa linhas sem data OU sem cliente OU sem tipo de serviço
+    # ── Remove linhas sem data, sem cliente ou sem serviço ───────────────────
     work = work.dropna(subset=["_data_parsed"]).copy()
-    work = work[work[col_cliente].notna() & work[col_servico].notna()].copy()
+    work = work[
+        work[col_cliente].notna() & (work[col_cliente].astype(str).str.strip() != "") &
+        work[col_servico].notna() & (work[col_servico].astype(str).str.strip() != "")
+    ].copy()
 
     if work.empty:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
@@ -163,8 +159,12 @@ def detect_duplicates(
     work["_cliente_norm"] = work[col_cliente].astype(str).str.strip().str.upper()
     work["_servico_norm"] = work[col_servico].astype(str).str.strip().str.upper()
 
-    # 3) Algoritmo de detecção (janela) ------------------------------
-    registros = []
+    # ── Algoritmo de detecção ─────────────────────────────────────────────────
+    # ATENÇÃO: grupo_counter é GLOBAL — não reinicia a cada (cliente, serviço)
+    # Isso garante que grupo_duplicidade seja único em todo o dataset
+    registros      = []
+    grupo_counter  = 0   # ← GLOBAL, fora do loop
+
     for (_, _), grp in work.groupby(["_cliente_norm", "_servico_norm"], sort=False):
         if len(grp) < 2:
             continue
@@ -174,18 +174,18 @@ def detect_duplicates(
         row_ids = grp["_row_id"].tolist()
         n       = len(grp)
 
-        classificacao = {}   # row_id -> {"grupo": int, "tipo": "ORIGINAL"|"DUPLICATA"}
-        grupo_counter = 0
+        classificacao = {}   # local ao grupo (cliente, serviço)
         i = 0
 
         while i < n:
             rid_i = row_ids[i]
 
-            # se já foi marcada DUPLICATA, não vira âncora
+            # DUPLICATA não vira âncora de novo grupo
             if rid_i in classificacao and classificacao[rid_i]["tipo"] == "DUPLICATA":
                 i += 1
                 continue
 
+            # Busca OS posteriores dentro da janela ainda não classificadas
             duplicatas_j = []
             for j in range(i + 1, n):
                 delta = (datas[j] - datas[i]).days
@@ -197,11 +197,11 @@ def detect_duplicates(
                     break
 
             if duplicatas_j:
-                grupo_counter += 1
-                # âncora = ORIGINAL
+                grupo_counter += 1   # ← incrementa o contador GLOBAL
+
                 if rid_i not in classificacao:
                     classificacao[rid_i] = {"grupo": grupo_counter, "tipo": "ORIGINAL"}
-                # demais = DUPLICATA
+
                 for j in duplicatas_j:
                     classificacao[row_ids[j]] = {"grupo": grupo_counter, "tipo": "DUPLICATA"}
 
@@ -217,14 +217,14 @@ def detect_duplicates(
     if not registros:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-    # 4) Monta df_merged com todas as colunas originais + classificação
+    # ── Monta DataFrame de saída ──────────────────────────────────────────────
     df_class  = pd.DataFrame(registros).drop_duplicates("_row_id")
     df_merged = work.merge(df_class, on="_row_id", how="inner")
     df_merged = df_merged.sort_values(
         ["grupo_duplicidade", "_data_parsed", "tipo_registro"]
     ).reset_index(drop=True)
 
-    # 5) Detalhamento: sempre inclui as colunas escolhidas
+    # ── Detalhamento ─────────────────────────────────────────────────────────
     output_cols = ["grupo_duplicidade", "tipo_registro"]
     if col_os:
         output_cols.append(col_os)
@@ -232,11 +232,10 @@ def detect_duplicates(
     if cols_extras:
         output_cols += [c for c in cols_extras if c not in output_cols]
 
-    cols_existentes = [c for c in output_cols if c in df_merged.columns]
-    df_det = df_merged[cols_existentes].copy()
+    df_det = df_merged[[c for c in output_cols if c in df_merged.columns]].copy()
     df_det[col_data] = df_merged["_data_parsed"].dt.strftime("%d/%m/%Y")
 
-    # 6) Resumo por grupo
+    # ── Resumo por grupo ──────────────────────────────────────────────────────
     resumo_grupos = []
     for gid, grp in df_merged.groupby("grupo_duplicidade"):
         orig = grp[grp["tipo_registro"] == "ORIGINAL"]
@@ -264,12 +263,13 @@ def detect_duplicates(
 
     df_resumo_grupos = pd.DataFrame(resumo_grupos)
 
-    # 7) Resumo por serviço
+    # ── Resumo por tipo de serviço ────────────────────────────────────────────
     cont_cli_serv = (
         work.groupby(["_servico_norm", "_cliente_norm"])
         .size()
         .reset_index(name="total_os_cliente")
     )
+
     resumo_servico = []
     dups_only = df_merged[df_merged["tipo_registro"] == "DUPLICATA"]
 
