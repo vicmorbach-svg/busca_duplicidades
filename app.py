@@ -418,7 +418,7 @@ def paginar(df: pd.DataFrame, key: str, page_size: int = 500):
 # ── Ingestão de novo lote ─────────────────────────────────────────────────────
 def ingerir_lote():
     st.sidebar.divider()
-    st.sidebar.subheader("📥 Ingerir novo lote")
+    st.sidebar.subheader("📥 Inserir novo lote")
 
     arq_lote = st.sidebar.file_uploader(
         "Arquivo do lote (.xlsx/.csv)",
@@ -445,8 +445,8 @@ def ingerir_lote():
     cols_lote = list(df_preview.columns)
 
     lote_nome    = st.sidebar.text_input("Nome do lote", value=datetime.now().strftime("%Y-%m"))
-    lote_cliente = st.sidebar.selectbox("Coluna cliente",       cols_lote, key="lc")
-    lote_servico = st.sidebar.selectbox("Coluna serviço",       cols_lote, key="ls")
+    lote_cliente = st.sidebar.selectbox("Coluna matricula",       cols_lote, key="lc")
+    lote_servico = st.sidebar.selectbox("Coluna tipo de serviço",       cols_lote, key="ls")
     lote_data    = st.sidebar.selectbox("Coluna data",          cols_lote, key="ld")
     lote_os_raw  = st.sidebar.selectbox("Coluna OS (opcional)", ["— nenhuma —"] + cols_lote, key="lo")
     lote_os      = None if lote_os_raw == "— nenhuma —" else lote_os_raw
@@ -518,7 +518,7 @@ with st.sidebar:
     else:
         stats = stats_base()
         st.metric("Total de OS",       f"{int(stats.get('total_registros', 0)):,}")
-        st.metric("Lotes ingeridos",    int(stats.get("total_lotes", 0)))
+        st.metric("Lotes inseridos",    int(stats.get("total_lotes", 0)))
         st.metric("Clientes únicos",    f"{int(stats.get('clientes_unicos', 0)):,}")
         st.metric("Serviços distintos", int(stats.get("servicos_unicos", 0)))
 
@@ -542,7 +542,7 @@ st.divider()
 
 # ── Verifica base ─────────────────────────────────────────────────────────────
 if not PARQUET_MESTRE.exists():
-    st.info("Ingira o primeiro lote pela barra lateral para começar.")
+    st.info("Insira o primeiro lote pela barra lateral para começar.")
     st.stop()
 
 # ── Filtros de consulta ───────────────────────────────────────────────────────
@@ -604,7 +604,7 @@ if "df_base" in st.session_state and not st.session_state["df_base"].empty:
     ca1, ca2, ca3 = st.columns(3)
 
     col_cliente = ca1.selectbox(
-        "👤 Coluna de cliente",
+        "👤 Coluna de matrícula",
         cols_visiveis,
         index=cols_visiveis.index(
             suggest(["cliente", "matricula", "cpf", "cod"], cols_visiveis) or cols_visiveis[0]
