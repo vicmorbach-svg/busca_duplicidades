@@ -367,7 +367,76 @@ with st.sidebar:
         if st.button("🔄 Recarregar estatísticas", use_container_width=True):
             st.cache_data.clear()
             st.rerun()
+# Adicione no app.py, antes do st.divider() principal
+with st.sidebar:
+    st.divider()
+    st.subheader("📥 Ingerir novo lote")
 
+    arq_lote = st.file_uploader(
+        "Arquivo do lote (.xlsx/.csv)",
+        type=["xlsx", "xls", "csv"],
+        key="upload_lote"
+    )
+
+    if arq_lote:
+        cols_lote = None
+
+        # Lê só o cabeçalho para mostrar as colunas
+        buf = arq_lote.read()
+        import io as _io
+        df_preview = (
+            pd.read_csv(_io.BytesIO(buf), dtype=str, nrows=3)
+            if arq_lote.name.endswith(".csv")
+            else pd.read_excel(_io.BytesIO(buf), dtype=str, nrows=3)
+        )
+        df_preview.columns = df_preview.columns.str.strip()
+        cols_lote = list(df_preview.columns)
+
+        lote_nome    = st.text_input("Nome do lote", value=datetime.now().strftime("%Y-%m"))
+        lote_cliente = st.selectbox("Coluna cliente",  cols_lote, key="lc")
+        lote_servico = st.selectbox("Coluna serviço",  cols_lote, key="ls")
+        lote_data    = st.selectbox("Coluna data",     cols_lote, key="ld")
+        lote_os      = st.selectbox("Coluna OS (opcional)", ["— nenhuma —"] + cols_lote, key="lo")
+        lote_os      = None if lote_os == "— nenhuma —" else lote_os
+
+        if st.button("⚙️ Processar e adicionar à base", use_container_width=True):
+            import io as _io2
+            df_lote = (
+                pd.read_csv(_io2.BytesIO(buf), dtype=str)
+                if arq_lote.name.endswith(".csv")
+                else pd.read_excel(_io2.BytesIO(buf), dtype=str)
+            )
+            df_lote.columns = df_lote.columns.str.strip()
+
+            df_lote["_data_parsed"]  = parse_dates_robust(df_lote[lote_data].astype(str).str.strip())
+            df_lote["_cliente_norm"] = df_lote[lote_cliente].astype(str).str.strip().str.upper()
+            df_lote["_servico_norm"] = df_lote[lote_servico].astype(str).str.strip().str.upper()
+            df_lote["_lote"]         = lote_nome
+            df_lote["_ingestao_ts"]  = datetime.now().isoformat()
+
+            # Verifica lote duplicado
+            lotes_existentes = listar_lotes()
+            if lote_nome in lotes_existentes:
+                st.error(f"Lote '{lote_nome}' já existe na base. Escolha outro nome.")
+            else:
+                # Atualiza mestre
+                if PARQUET_MESTRE.exists():
+                    df_antigo = pd.read_parquet(PARQUET_MESTRE)
+                    df_total  = pd.concat([df_antigo, df_lote], ignore_index=True)
+                else:
+                    df_total = df_lote
+
+                df_total.to_parquet(PARQUET_MESTRE, index=False, compression="snappy")
+
+                invalidas = df_lote["_data_parsed"].isna().sum()
+                st.success(
+                    f"✅ Lote **{lote_nome}** adicionado!\n\n"
+                    f"- {len(df_lote):,} registros no lote\n"
+                    f"- {len(df_total):,} registros na base total\n"
+                    f"- {invalidas:,} datas inválidas ignoradas"
+                )
+                st.cache_data.clear()
+                st.rerun()
     st.divider()
     st.caption("Para ingerir um novo lote:\n```\npython atualiza_base.py \\\n  --arquivo lote.xlsx \\\n  --col_cliente matricula \\\n  --col_servico tipo_servico \\\n  --col_data data_abertura\n```")
 
